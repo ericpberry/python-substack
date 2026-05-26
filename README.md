@@ -253,20 +253,101 @@ body:
     src: "local_image.jpg"  # Local images will be uploaded automatically
 ```
 
+## Publishing a Podcast Episode
+
+The `PodcastPost` class is the podcast counterpart to `Post`. A podcast draft
+carries two distinct ProseMirror documents -- `draft_body` (the post-page
+body, same field a newsletter Post uses) and `podcast_description` (the show
+notes shown alongside the audio player) -- and adds podcast-specific fields
+like `draft_podcast_upload_id` and `draft_podcast_duration`. Both ProseMirror
+docs are independently optional.
+
+The audio upload uses Substack's three-step S3 protocol (initiate -> PUT
+bytes -> trigger transcode) plus polling until the media object reaches
+`state == "transcoded"`. `Api.upload_podcast_audio` wraps the whole
+sequence; duration is computed locally with mutagen.
+
+```python
+import os
+from dotenv import load_dotenv
+
+from substack import Api, PodcastPost
+
+load_dotenv()
+
+api = Api(
+    cookies_string=os.getenv("COOKIES_STRING"),
+    publication_url=os.getenv("PUBLICATION_URL"),
+)
+user_id = api.get_user_id()
+
+# 1. Build the podcast draft in memory.
+pod = (
+    PodcastPost(
+        title="Episode 7: Async I/O",
+        subtitle="What asyncio buys you, and what it costs",
+        user_id=user_id,
+        audience="everyone",
+    )
+    .set_body_from_markdown("Full episode text mirror for the post page.")
+    .set_show_notes_from_markdown(
+        "## Show notes\n\n- Event loops\n- Backpressure\n"
+    )
+)
+
+# 2. Create the draft. We need a draft id before we can upload audio
+#    (Substack scopes the upload to a post_id at init time).
+draft = api.post_draft(pod.get_draft())
+draft_id = draft["id"]
+
+# 3. Upload the audio. Returns once the media object is transcoded.
+media = api.upload_podcast_audio(file_path="episode-07.mp3", draft_id=draft_id)
+
+# 4. Attach the audio. Thread last_updated_at from the create response so
+#    subsequent PUTs match the server's optimistic-concurrency token.
+pod.set_audio(media["id"], duration_seconds=media["duration"])
+pod.last_updated_at = draft.get("draft_updated_at")
+api.put_draft(draft_id, **pod.get_draft())
+
+# 5. Prepublish (server-side validation) and publish.
+api.prepublish_draft(draft_id)
+api.publish_draft(draft_id, send=True, share_automatically=False)
+```
+
+A runnable end-to-end example lives at
+[`examples/publish_podcast.py`](examples/publish_podcast.py) (`--help` for
+flags including `--audio`, `--body-file`, `--show-notes-file`, `--publish`,
+and `--no-send` for sandbox testing).
+
 ## MCP FastMCP server
 
-This package now includes a FastMCP server in `substack/mcp_fastmcp.py` with the following tools:
+This package includes a FastMCP server in `substack_mcp/mcp_server.py` with
+the following tools:
 
-- `post_draft_from_markdown(...)`: create draft from markdown, optional tag/add/prepublish/publish, and control send/share_automatically.
+Newsletter:
+
+- `post_draft_from_markdown(...)`: create a newsletter draft from markdown, with optional tag/prepublish/publish.
 - `put_draft(draft_id, update_payload)`: update draft fields.
 - `add_tags(draft_id, tags)`: add tags to a draft/post.
 - `prepublish_draft(draft_id)`: prepublish a draft.
 - `publish_draft(draft_id, send=True, share_automatically=False)`: publish a draft.
 
+Podcast:
+
+- `upload_podcast_audio(file_path, draft_id)`: upload an MP3 and wait for
+  transcoding. Returns the final media object with `state == "transcoded"`.
+  The audio UUID (`id` field) is what attaches the upload to a draft.
+- `post_podcast_draft_from_markdown(...)`: create (and optionally publish)
+  a podcast episode end-to-end. Composes draft creation + optional audio
+  upload + attach + optional tag + optional prepublish + optional publish
+  in a single call. Show notes (`podcast_description`) and post-page body
+  (`draft_body`) are independently optional. Returns a dict surfacing each
+  composed step's result.
+
 Use via stdio transport:
 
 ```bash
-python -c "from substack.mcp_fastmcp import main; main()"
+python -c "from substack_mcp.mcp_server import main; main()"
 ```
 
 # Contributing

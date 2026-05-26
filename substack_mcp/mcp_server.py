@@ -11,6 +11,7 @@ except ImportError:
 from mcp.server.fastmcp import FastMCP
 
 from substack.api import Api
+from substack.podcast import PodcastPost
 from substack.post import Post
 
 if load_dotenv is not None:
@@ -283,6 +284,202 @@ async def publish_draft(
     return client.publish_draft(
         draft_id, send=send, share_automatically=share_automatically
     )
+
+
+@mcp.tool()
+async def upload_podcast_audio(
+    file_path: str,
+    draft_id: int,
+) -> Dict[str, Any]:
+    """Upload a podcast audio file (typically an MP3) and wait for transcoding.
+
+    Performs the full Substack upload sequence: initiate, PUT raw bytes to
+    the pre-signed S3 URL(s), trigger transcode, and poll the media object
+    until its state is ``"transcoded"``. Duration is computed locally via
+    mutagen and sent with the transcode call.
+
+    Args:
+        file_path: Local path to the audio file on the machine running this
+            MCP server.
+        draft_id: ID of the podcast draft this audio is being attached to.
+            Substack scopes the upload to a ``post_id`` at init time, so the
+            draft must already exist.
+
+    Returns:
+        The final media object dict with ``state == "transcoded"``. The
+        ``id`` field is the audio UUID; pass it as ``audio_upload_id`` /
+        ``draft_podcast_upload_id`` to attach the audio to a draft.
+
+    Examples:
+        ```python
+        from substack_mcp.mcp_server import (
+            post_podcast_draft_from_markdown,
+            upload_podcast_audio,
+            put_draft,
+        )
+
+        # Create a podcast shell first so we have a draft_id to scope the
+        # upload to.
+        d = await post_podcast_draft_from_markdown(title='Episode 1')
+        draft_id = d['draft']['id']
+
+        media = await upload_podcast_audio(
+            file_path='/abs/path/episode-01.mp3',
+            draft_id=draft_id,
+        )
+        # media['id'] is the upload UUID; attach it to the draft:
+        await put_draft(draft_id, {'draft_podcast_upload_id': media['id']})
+        ```
+    """
+    client = get_api()
+    return client.upload_podcast_audio(file_path=file_path, draft_id=draft_id)
+
+
+@mcp.tool()
+async def post_podcast_draft_from_markdown(
+    title: str,
+    subtitle: Optional[str] = "",
+    show_notes_markdown: Optional[str] = None,
+    post_body_markdown: Optional[str] = None,
+    audio_file_path: Optional[str] = None,
+    audience: str = "everyone",
+    write_comment_permissions: Optional[str] = None,
+    draft_section_id: Optional[int] = None,
+    tags: Optional[Any] = None,
+    prepublish: bool = False,
+    publish: bool = False,
+    send: bool = True,
+    share_automatically: bool = False,
+) -> Dict[str, Any]:
+    """Create (and optionally publish) a Substack podcast draft end-to-end.
+
+    Composes the full podcast publishing flow: build a ``PodcastPost`` from
+    the supplied fields, create the draft, optionally upload + attach audio,
+    optionally tag, optionally prepublish, optionally publish. Each step is
+    independently opt-in and surfaced separately in the return value.
+
+    Show notes (``podcast_description``) and the post-page body
+    (``draft_body``) are two distinct ProseMirror documents on a podcast
+    draft; both are independently optional.
+
+    Args:
+        title: Episode title.
+        subtitle: Optional subtitle.
+        show_notes_markdown: Markdown for the show notes
+            (``podcast_description``). Renders alongside the audio player.
+        post_body_markdown: Markdown for the post-page body (``draft_body``).
+            Same field a newsletter post uses.
+        audio_file_path: Local path to the episode audio file (MP3). When
+            provided, the audio is uploaded via :func:`upload_podcast_audio`
+            and attached to the draft.
+        audience: One of ``everyone``, ``only_paid``, ``founding``, ``only_free``.
+        write_comment_permissions: One of ``none``, ``only_paid``, ``everyone``.
+            Defaults to ``audience`` when omitted.
+        draft_section_id: Optional section ID.
+        tags: Tag or list of tags to attach to the post.
+        prepublish: If true, calls ``prepublish_draft`` (server-side validation).
+        publish: If true, calls ``publish_draft``.
+        send: Passed to ``publish_draft`` -- newsletter email delivery on
+            publish. Ignored when ``publish`` is false.
+        share_automatically: Passed to ``publish_draft``. Substack's podcast
+            publish endpoint ignores this key, but it is included for
+            symmetry with :func:`post_draft_from_markdown`.
+
+    Returns:
+        Dict with one key per composed step:
+
+          * ``draft``: latest draft / post object (post-PUT if audio attached,
+            otherwise the create response; not replaced by the publish response).
+          * ``upload``: transcoded media object, or ``None`` if no audio uploaded.
+          * ``tags``: result of ``add_tags_to_post``, or ``None`` if no tags.
+          * ``prepublish``: result of ``prepublish_draft``, or ``None`` if skipped.
+          * ``publish``: result of ``publish_draft``, or ``None`` if skipped.
+
+    Examples:
+        Minimal draft, no audio, stop at draft stage:
+
+        ```python
+        from substack_mcp.mcp_server import post_podcast_draft_from_markdown
+
+        result = await post_podcast_draft_from_markdown(
+            title='Pilot episode',
+            subtitle='Where it all begins',
+            show_notes_markdown='## Topics\\n\\n- Topic one\\n- Topic two',
+        )
+        draft_id = result['draft']['id']
+        ```
+
+        Full end-to-end publish (no email, safe for sandbox):
+
+        ```python
+        result = await post_podcast_draft_from_markdown(
+            title='Episode 7: Async I/O',
+            subtitle='What asyncio buys you, and what it costs',
+            show_notes_markdown='## Show notes\\n\\n- Event loops\\n- Backpressure',
+            post_body_markdown='Full episode text mirror for the post page.',
+            audio_file_path='/abs/path/episode-07.mp3',
+            tags=['python', 'async'],
+            prepublish=True,
+            publish=True,
+            send=False,
+        )
+        assert result['publish']['is_published']
+        ```
+    """
+    client = get_api()
+    user_id = client.get_user_id()
+
+    pod = PodcastPost(
+        title=title,
+        subtitle=subtitle or "",
+        user_id=user_id,
+        audience=audience,
+        write_comment_permissions=write_comment_permissions,
+    )
+
+    if show_notes_markdown:
+        pod.set_show_notes_from_markdown(show_notes_markdown, api=client)
+    if post_body_markdown:
+        pod.set_body_from_markdown(post_body_markdown, api=client)
+    if draft_section_id is not None:
+        pod.draft_section_id = draft_section_id
+
+    draft = client.post_draft(pod.get_draft())
+    draft_id = draft["id"]
+
+    upload_result: Optional[Dict[str, Any]] = None
+    if audio_file_path:
+        upload_result = client.upload_podcast_audio(
+            file_path=audio_file_path, draft_id=draft_id
+        )
+        pod.set_audio(
+            upload_result["id"], duration_seconds=upload_result.get("duration")
+        )
+        pod.last_updated_at = draft.get("draft_updated_at")
+        draft = client.put_draft(draft_id, **pod.get_draft())
+
+    tags_list = _normalize_tags(tags)
+    tags_result = None
+    if tags_list:
+        tags_result = client.add_tags_to_post(draft_id, tags_list)
+
+    prepublish_result = None
+    if prepublish:
+        prepublish_result = client.prepublish_draft(draft_id)
+
+    publish_result = None
+    if publish:
+        publish_result = client.publish_draft(
+            draft_id, send=send, share_automatically=share_automatically
+        )
+
+    return {
+        "draft": draft,
+        "upload": upload_result,
+        "tags": tags_result,
+        "prepublish": prepublish_result,
+        "publish": publish_result,
+    }
 
 
 def main() -> None:
