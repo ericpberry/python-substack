@@ -9,3 +9,4 @@ __download_url__ = "https://pypi.python.org/pypi/python-substack"
 __description__ = "A Python wrapper around the Substack API"
 
 from .api import Api
+from .podcast import PodcastPost
