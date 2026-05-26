@@ -130,3 +130,7 @@ dmypy.json
 
 .idea/
 .vscode/
+.env
+
+# Generated test fixtures (recreated by conftest on demand).
+tests/fixtures/

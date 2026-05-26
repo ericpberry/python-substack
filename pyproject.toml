@@ -21,8 +21,13 @@ python = "<4.0,>=3.10"
 requests = "^2.32.0"
 python-dotenv = "^1.2.1"
 PyYAML = "^6.0"
+mutagen = "^1.47"
 
 [tool.poetry.group.dev.dependencies]
+pytest = "^9.0"
+# lameenc generates the tiny silent MP3 used by the integration test fixture.
+# Pure-Python wheels with LAME bundled -- no ffmpeg / system dependency.
+lameenc = "^1.8"
 
 [tool.poetry.group.mcp]
 
@@ -34,3 +39,8 @@ fastmcp = "^3.1.1"
 [build-system]
 requires = ["poetry-core>=1.0.0"]
 build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: tests that hit the real Substack API. Skipped unless RUN_INTEGRATION_TESTS=1 is set in the environment.",
+]

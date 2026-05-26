@@ -8,10 +8,12 @@ import base64
 import json
 import logging
 import os
+import time
 from datetime import datetime
 from urllib.parse import urljoin, unquote
 
 import requests
+from mutagen.mp3 import MP3
 
 from substack.exceptions import SubstackAPIException, SubstackRequestException
 
@@ -514,6 +516,110 @@ class Api:
             data={"image": image},
         )
         return Api._handle_response(response=response)
+
+    def upload_podcast_audio(
+        self,
+        file_path: str,
+        draft_id: int,
+        poll_timeout_seconds: float = 120,
+        poll_interval_seconds: float = 3,
+    ) -> dict:
+        """
+
+        Upload an audio file for a podcast draft and wait until transcoding completes.
+
+        Performs the full sequence: initiate upload, PUT raw bytes to the
+        pre-signed S3 URL(s) returned by init, trigger transcode (which
+        finalizes the multipart upload and starts the async transcode job),
+        then poll the media object until its state is ``"transcoded"``.
+        Duration is computed locally via mutagen and sent with the transcode
+        call.
+
+        Args:
+            file_path: Local path to the audio file (typically an MP3).
+            draft_id: ID of the podcast draft this upload is scoped to.
+                Substack requires a ``post_id`` on the init call.
+            poll_timeout_seconds: Maximum time to wait for transcoding to
+                complete before raising.
+            poll_interval_seconds: Delay between successive state polls.
+
+        Returns:
+            The final media object dict (``state == "transcoded"``). Its
+            ``id`` field is the audio UUID to attach to a draft as
+            ``draft_podcast_upload_id``.
+
+        Raises:
+            SubstackAPIException: on non-2xx from any Substack endpoint
+                (init, transcode, or poll).
+            SubstackRequestException: on S3 PUT failure or transcode timeout.
+        """
+        path = os.fspath(file_path)
+        file_size = os.path.getsize(path)
+        file_name = os.path.basename(path)
+        duration_seconds = MP3(path).info.length
+
+        # 1. Initiate upload -- returns the media UUID, multipart upload id,
+        #    and one or more pre-signed S3 PUT URLs (today always 1 URL).
+        init_response = self._session.post(
+            f"{self.publication_url}/audio/upload",
+            params={
+                "filetype": "audio/mpeg",
+                "fileSize": file_size,
+                "fileName": file_name,
+                "post_id": draft_id,
+            },
+        )
+        init_data = Api._handle_response(response=init_response)
+        upload_id = init_data["mediaUpload"]["id"]
+        multipart_upload_id = init_data["multipartUploadId"]
+        upload_urls = init_data["multipartUploadUrls"]
+
+        # 2. PUT bytes to each part URL. S3 returns no body; the ETag header
+        #    (including its surrounding double-quotes) is what we need.
+        #    This is the only HTTP call in the codebase that does not route
+        #    through _handle_response -- see docs/STYLE.md section 6.
+        with open(path, "rb") as f:
+            audio_bytes = f.read()
+        etags = []
+        for url in upload_urls:
+            s3_response = self._session.put(url, data=audio_bytes)
+            if not s3_response.ok:
+                body_preview = (s3_response.text or "")[:500]
+                raise SubstackRequestException(
+                    f"S3 upload failed: {s3_response.status_code} {body_preview}"
+                )
+            etags.append(s3_response.headers["ETag"])
+
+        # 3. Trigger transcode. Returns immediately with state "uploaded";
+        #    actual transcoding happens asynchronously. Trust 2xx and proceed
+        #    to polling; the poll loop is the source of truth on transcode
+        #    completion.
+        transcode_response = self._session.post(
+            f"{self.publication_url}/audio/upload/{upload_id}/transcode",
+            json={
+                "duration": duration_seconds,
+                "multipart_upload_id": multipart_upload_id,
+                "multipart_upload_etags": etags,
+            },
+        )
+        Api._handle_response(response=transcode_response)
+
+        # 4. Poll until state == "transcoded" (or raise on timeout).
+        deadline = time.monotonic() + poll_timeout_seconds
+        while True:
+            poll_response = self._session.get(
+                f"{self.publication_url}/audio/upload/{upload_id}"
+            )
+            media = Api._handle_response(response=poll_response)
+            if media.get("state") == "transcoded":
+                return media
+            if time.monotonic() >= deadline:
+                raise SubstackRequestException(
+                    f"Audio transcode did not complete within "
+                    f"{poll_timeout_seconds}s (uuid={upload_id}, "
+                    f"last state={media.get('state')!r})"
+                )
+            time.sleep(poll_interval_seconds)
     
     def add_tags_to_post(self, post_id: int, tag_names: list) -> dict:
         """
